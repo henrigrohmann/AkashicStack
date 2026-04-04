@@ -1,26 +1,42 @@
 import typer
 import httpx
+import json
 
-cli = typer.Typer()
+app = typer.Typer()
 API_URL = "http://localhost:8000"
 
-@cli.command()
-def watch():
-    """バックエンドに溜まっていくチャンクをリアルタイム監視(簡易版)"""
-    typer.echo("Monitoring Akasha memory status...")
-    # ここにWebSocketまたはポーリングによる監視ロジックを実装
+@app.command()
+def write(content: str):
+    """新しいチャンクを書き込む"""
+    # CLI側でエスケープ処理などは暗黙的に行われる（引数として受け取るため）
+    resp = httpx.post(f"{API_URL}/chunks", json={"content": content})
+    typer.echo(json.dumps(resp.json(), indent=2))
 
-@cli.command()
-def seed():
-    """テスト用の初期データを投入"""
-    test_data = [
-        {"uid": "U01", "body": "今日は #Harmonia の設計。", "meta": {"tags": ["Harmonia"]}},
-        {"uid": "U02", "body": "#Akasha は静的な記憶。", "meta": {"tags": ["Akasha"]}}
-    ]
-    for d in test_data:
-        httpx.post(f"{API_URL}/chunks", json=d)
-    typer.echo("Seeding completed.")
+@app.command()
+def read(key: str):
+    """特定のキーの情報をJSONで表示する"""
+    resp = httpx.get(f"{API_URL}/chunks/{key}")
+    typer.echo(json.dumps(resp.json(), indent=2))
+
+@app.command()
+def tag(key: str, trait: str):
+    """チャンクにタグ（Trait）を付与する"""
+    resp = httpx.put(f"{API_URL}/chunks/{key}/traits", json={"trait": trait})
+    typer.echo(json.dumps(resp.json(), indent=2))
+
+@app.command()
+def find(traits: list[str]):
+    """特定のタグを持つチャンクを検索する"""
+    # query parameterとして送信
+    params = {"q": ",".join(traits)}
+    resp = httpx.get(f"{API_URL}/traits/search", params=params)
+    typer.echo(json.dumps(resp.json(), indent=2))
+
+@app.command()
+def list(limit: int = 20):
+    """直近のチャンクを一覧表示する"""
+    resp = httpx.get(f"{API_URL}/chunks", params={"limit": limit})
+    typer.echo(json.dumps(resp.json(), indent=2))
 
 if __name__ == "__main__":
-    cli()
-
+    app()
