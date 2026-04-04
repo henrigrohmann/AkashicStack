@@ -6,6 +6,12 @@ from datetime import datetime
 class AkashaEngine:
     def __init__(self, db_path: str = "data/akasha.db"):
         self.db_path = db_path
+        
+        # ディレクトリが存在しない場合
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir)
+            
         self._bootstrap()
 
     def _bootstrap(self):
