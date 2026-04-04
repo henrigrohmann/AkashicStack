@@ -67,7 +67,7 @@ The stack is composed of five specialized libraries, each corresponding to a bio
 —-
 
 # Clone the repository
-git clone [https://github.com/your-repo/akashic-stack.git](https://github.com/your-repo/akashic-stack.git)
+git clone [https://github.com/your-repo/akashic-stack.git]([https://github.com/your-repo/akashic-stack.git](https://github.com/henrigrohmann/AkashicStack.git))
 cd akashic-stack
 
 # Install development dependencies
