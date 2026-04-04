@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from lib.akasha.engine import AkashaEngine
+
 app = FastAPI(title="Akashic Stack API")
 memory = AkashaEngine()
 
