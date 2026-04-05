@@ -1,23 +1,16 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from pydantic import BaseModel
-
 from lib.akasha.engine import AkashaEngine
 
-app = FastAPI(title="Akashic Stack API")
-memory = AkashaEngine()
+app = FastAPI()
+engine = AkashaEngine()
 
-class ChunkInput(BaseModel):
-    uid: str
-    body: str
-    meta: dict
+# リクエストボディの定義を新体系に合わせる
+class ChunkCreate(BaseModel):
+    content: str
 
 @app.post("/chunks")
-async def add_chunk(data: ChunkInput):
-    c_hash = memory.put(data.body, data.meta, data.uid)
-    return {"status": "stored", "hash": c_hash}
-
-@app.get("/tags/{tag_name}")
-async def get_by_tag(tag_name: str):
-    # メタデータ内のタグを検索するロジック（後述のsearch拡張にて）
-    return {"tag": tag_name, "chunks": []}
-
+async def create_chunk(chunk: ChunkCreate):
+    # uidなどを要求せず、contentだけでcommitを呼ぶ
+    result = engine.commit(chunk.content)
+    return result
