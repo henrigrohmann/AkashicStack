@@ -6,59 +6,36 @@ from lib.akasha.engine import AkashaEngine
 app = FastAPI(title="Akashic Stack API")
 engine = AkashaEngine()
 
-# --- Data Models ---
+class ChunkInput(BaseModel): content: str
+class TraitInput(BaseModel): trait: str
+class SetInput(BaseModel): name: str
 
-class ChunkInput(BaseModel):
-    content: str
+@app.post("/chunks", operation_id="write")
+async def create_chunk(input: ChunkInput): return engine.commit(input.content)
 
-class TraitInput(BaseModel):
-    trait: str
-
-class SetInput(BaseModel):
-    name: str
-
-# --- Endpoints ---
-
-@app.post("/chunks", operation_id="write", summary="Atomの刻印")
-async def create_chunk(input: ChunkInput):
-    """新しい文章を永続化し、ハッシュキー(key)を返します。"""
-    return engine.commit(input.content)
-
-@app.get("/chunks/{key}", operation_id="read", summary="Atomの参照")
+@app.get("/chunks/{key}", operation_id="read")
 async def read_chunk(key: str):
-    """指定されたキーに紐づくデータと特性を取得します。"""
-    result = engine.fetch(key)
-    if isinstance(result, dict) and "error" in result:
-        raise HTTPException(status_code=404, detail="Chunk not found")
-    return result
+    res = engine.fetch(key)
+    if "error" in res: raise HTTPException(status_code=404, detail="Not Found")
+    return res
 
-@app.put("/chunks/{key}/traits", operation_id="tag", summary="特性(Trait)の付与")
+@app.put("/chunks/{key}/traits", operation_id="tag")
 async def add_trait(key: str, input: TraitInput):
-    """指定されたAtomにタグを付与します。"""
-    result = engine.affix(key, input.trait)
-    if isinstance(result, dict) and "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-    return result
+    return engine.affix(key, input.trait)
 
-@app.get("/chunks", operation_id="list", summary="最近のAtom一覧")
-async def list_chunks(limit: int = 20):
-    """最近のAtomを時系列順に取得します。"""
-    return engine.stream(limit=limit)
+# --- 集合系: ここが修正ポイント ---
 
-# --- Set Operations ---
-
-@app.post("/sets", operation_id="set_create", summary="集合の新規作成")
+@app.post("/sets", operation_id="set_create")
 async def create_set(input: SetInput):
-    """新しい集合ノードを作成します。"""
-    # inputそのものではなく、input.name(str)を渡す
     return engine.create_set(input.name)
 
-@app.post("/sets/{name}/items", operation_id="set_add", summary="集合への追加")
+@app.post("/sets/{name}/items", operation_id="set_add")
 async def add_to_set(name: str, key: Optional[str] = None):
-    """指定した集合にAtomを追加します。"""
+    # クエリパラメータ ?key=... が空ならCLIの不備を通知
+    if not key:
+        return {"key": None, "error": "key_required"}
     return engine.add_to_set(name, key)
 
-@app.get("/sets/{name}", operation_id="set_list", summary="集合内のAtom取得")
-async def list_set_items(name: str, limit: int = 20):
-    """集合に含まれるAtomを取得します。"""
-    return engine.fetch_set(name, limit=limit)
+@app.get("/sets/{name}", operation_id="set_list")
+async def list_set_items(name: str):
+    return engine.fetch_set(name)
