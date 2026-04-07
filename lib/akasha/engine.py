@@ -1,3 +1,5 @@
+# lib/akasha.engine.py (フルコード)
+
 import os
 import sqlite3
 import hashlib
@@ -65,7 +67,7 @@ class AkashaEngine:
         return {"status": "created", "name": name}
 
     def add_to_set(self, name: str, key: str) -> Dict:
-        if not key or key == "None": return {"key": key, "error": "key_required"}
+        if not key or key == "None": return {"key": key, "error": "key_invalid"}
         self.create_set(name)
         target = self.fetch(key)
         if "error" in target: return target
