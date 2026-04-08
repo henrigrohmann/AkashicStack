@@ -1,5 +1,3 @@
-# lib/akasha.engine.py (フルコード)
-
 import os
 import sqlite3
 import hashlib
@@ -8,8 +6,13 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 class AkashaEngine:
-    def __init__(self, db_path: str = "data/akasha.db"):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None):
+        # ルートディレクトリからの相対パス、またはHarmoniaから注入されたパスを使用
+        if db_path is None:
+            self.db_path = os.path.join(os.getcwd(), "data", "akasha.db")
+        else:
+            self.db_path = db_path
+            
         self._ensure_directory()
         self._bootstrap()
 
@@ -19,26 +22,57 @@ class AkashaEngine:
             os.makedirs(db_dir, exist_ok=True)
 
     def _bootstrap(self):
+        """テーブル作成とジャーナル構造の初期化"""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS chunks (key TEXT PRIMARY KEY, content TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS chunks (
+                    key TEXT PRIMARY KEY, 
+                    content TEXT NOT NULL, 
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.execute("CREATE TABLE IF NOT EXISTS traits (key TEXT, trait TEXT, PRIMARY KEY (key, trait))")
             conn.execute("CREATE TABLE IF NOT EXISTS sets (name TEXT PRIMARY KEY)")
-            conn.execute("CREATE TABLE IF NOT EXISTS set_items (set_name TEXT, key TEXT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (set_name, key))")
-            conn.execute("CREATE TABLE IF NOT EXISTS journals (id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT, params TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS set_items (
+                    set_name TEXT, 
+                    key TEXT, 
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
+                    PRIMARY KEY (set_name, key)
+                )
+            """)
+            # ジャーナルをより「不沈」な構造へ強化
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS journals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                    action TEXT NOT NULL, 
+                    params TEXT, 
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             conn.commit()
 
-    def _log(self, action: str, params: Dict):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT INTO journals (action, params) VALUES (?, ?)", (action, json.dumps(params)))
-            conn.commit()
+    def _write_with_journal(self, action: str, params: Dict, sql_query: str, sql_params: tuple):
+        """操作とログを単一のトランザクションで実行（アトミック性確保）"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # 1. 実際のデータ操作
+                conn.execute(sql_query, sql_params)
+                # 2. ジャーナルの記録
+                conn.execute("INSERT INTO journals (action, params) VALUES (?, ?)", (action, json.dumps(params)))
+                conn.commit()
+        except sqlite3.Error as e:
+            # ここで発生したエラーは上位（Harmonia等）に伝播させ、Master Logに記録させる
+            raise e
 
     def commit(self, content: str) -> Dict:
         normalized = content.strip()
         key = hashlib.sha256(normalized.encode()).hexdigest()
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR IGNORE INTO chunks (key, content) VALUES (?, ?)", (key, normalized))
-            conn.commit()
-        self._log("COMMIT", {"key": key})
+        
+        self._write_with_journal(
+            "COMMIT", {"key": key},
+            "INSERT OR IGNORE INTO chunks (key, content) VALUES (?, ?)", (key, normalized)
+        )
         return {"key": key, "status": "committed"}
 
     def fetch(self, key: str) -> Dict:
@@ -51,30 +85,35 @@ class AkashaEngine:
         return {"key": key, "content": row["content"], "created_at": row["created_at"], "traits": traits}
 
     def affix(self, key: str, trait: str) -> Dict:
+        # 存在確認
         target = self.fetch(key)
         if "error" in target: return target
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR IGNORE INTO traits (key, trait) VALUES (?, ?)", (key, trait))
-            conn.commit()
-        self._log("AFFIX", {"key": key, "trait": trait})
+        
+        self._write_with_journal(
+            "AFFIX", {"key": key, "trait": trait},
+            "INSERT OR IGNORE INTO traits (key, trait) VALUES (?, ?)", (key, trait)
+        )
         return self.fetch(key)
 
     def create_set(self, name: str) -> Dict:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR IGNORE INTO sets (name) VALUES (?)", (name,))
-            conn.commit()
-        self._log("SET_CREATE", {"name": name})
+        self._write_with_journal(
+            "SET_CREATE", {"name": name},
+            "INSERT OR IGNORE INTO sets (name) VALUES (?)", (name,)
+        )
         return {"status": "created", "name": name}
 
     def add_to_set(self, name: str, key: str) -> Dict:
         if not key or key == "None": return {"key": key, "error": "key_invalid"}
+        
+        # 集合の存在保証とアイテム追加をアトミックに行うために分離
         self.create_set(name)
         target = self.fetch(key)
         if "error" in target: return target
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR IGNORE INTO set_items (set_name, key) VALUES (?, ?)", (name, key))
-            conn.commit()
-        self._log("SET_ADD", {"name": name, "key": key})
+        
+        self._write_with_journal(
+            "SET_ADD", {"name": name, "key": key},
+            "INSERT OR IGNORE INTO set_items (set_name, key) VALUES (?, ?)", (name, key)
+        )
         return {"status": "added", "name": name, "key": key}
 
     def fetch_set(self, name: str, limit: int = 20) -> List[Dict]:
