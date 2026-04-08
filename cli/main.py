@@ -1,4 +1,43 @@
+import httpx
+import sys
+import json
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+
+console = Console()
+
+class AkashicShell:
+    def __init__(self, api_url="http://localhost:8000"):
+        self.api_url = api_url
+        self.commands = {}
+        self.it = None
+
+    def sync_api(self):
+        """APIのOpenAPI仕様から動的にコマンドを同期する"""
+        try:
+            resp = httpx.get(f"{self.api_url}/openapi.json", timeout=5.0)
+            spec = resp.json()
+            self.commands = {}
+            for path, methods in spec['paths'].items():
+                for method, details in methods.items():
+                    op_id = details.get('operationId')
+                    if op_id:
+                        self.commands[op_id] = {
+                            "path": path, 
+                            "method": method.upper(),
+                            "summary": details.get('summary', ''),
+                            "description": details.get('description', '')
+                        }
+            return True
+        except Exception as e:
+            console.print(f"[red]API Sync Error: {e}[/red]")
+            return False
+
     def execute(self, cmd_name, args):
+        """動的コマンドの実行ロジック"""
         info = self.commands[cmd_name]
         url_path = info['path']
         method = info['method']
@@ -35,16 +74,15 @@
             elif cmd_name == "set_create":
                 payload = {"name": args[0] if args else ""}
             elif cmd_name == "set_add":
-                # API側の Optional[str] = None に合わせ、クエリまたはパスでkeyを送る
-                # $it または 引数があればそれをkeyとして採用
+                # $it または 第一引数を key としてクエリパラメータで送る
                 key_val = args[0] if args else self.it
                 params = {"key": key_val}
 
         try:
-            # params(Query) と json(Body) を適切に分離
+            # APIリクエストの実行
             resp = httpx.request(method, url, json=payload, params=params)
             
-            # ステータスコードに応じた表示
+            # ステータスコードに応じたエラー表示
             if resp.is_error:
                 console.print(f"[red]Status: {resp.status_code}[/red]")
             
@@ -53,10 +91,8 @@
             except json.JSONDecodeError:
                 data = {"text": resp.text}
 
-            # $it の更新ロジック
-            # 書き込み、読み込み、またはセット追加成功時に、対象のkeyを保持する
+            # $it (コンテキスト) の更新ロジック
             if isinstance(data, dict):
-                # エンジンが返す 'key' 属性を優先的にキャッチ
                 new_key = data.get("key")
                 if new_key and new_key != "None":
                     self.it = new_key
@@ -66,3 +102,44 @@
             
         except Exception as e:
             console.print(f"[red]Request Error: {e}[/red]")
+
+    def run(self):
+        """メインループの実行"""
+        if not self.sync_api():
+            console.print("[yellow]Retrying API sync... Make sure uvicorn is running.[/yellow]")
+            if not self.sync_api(): return
+
+        # コマンド補完の設定
+        session = PromptSession(
+            completer=WordCompleter(list(self.commands.keys()) + ["help", "exit", "sync"])
+        )
+        
+        console.print(Panel(
+            "[bold green]Akashic Stack Shell v0.2[/bold green]\n"
+            "Dynamic Set Operations: [cyan]Enabled[/cyan]"
+        ))
+        
+        while True:
+            try:
+                # プロンプトに現在の$itを表示
+                label = f" [blue]($it:{self.it[:8]}...)[/blue]" if self.it else ""
+                text = session.prompt(f"Stack{label} > ").strip()
+                
+                if not text: continue
+                parts = text.split()
+                cmd = parts[0]
+                
+                if cmd == "exit":
+                    break
+                elif cmd == "sync":
+                    self.sync_api()
+                elif cmd in self.commands:
+                    self.execute(cmd, parts[1:])
+                else:
+                    console.print(f"[red]Unknown command: {cmd}[/red]")
+                    
+            except (KeyboardInterrupt, EOFError):
+                break
+
+if __name__ == "__main__":
+    AkashicShell().run()
