@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import subprocess
@@ -15,23 +16,34 @@ class AkashaAdapter:
         self.proc = None
         
         if mode == "stdio":
-            # APIを子プロセスとして起動 (API側の--stdioフラグを立てる)
+            # APIを子プロセスとして起動
+            # PYTHONPATHを現在の作業ディレクトリに設定して lib を見つけさせる
+            env = os.environ.copy()
+            env["PYTHONPATH"] = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
             self.proc = subprocess.Popen(
                 [sys.executable, "api/main.py", "--stdio"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=sys.stderr, # エラーはそのまま表示
+                stderr=sys.stderr, 
                 text=True,
-                bufsize=1
+                bufsize=1,
+                env=env
             )
 
     def call(self, cmd, args=[]):
         if self.mode == "stdio":
-            payload = json.dumps({"cmd": cmd, "args": args})
-            self.proc.stdin.write(payload + "\n")
-            return json.loads(self.proc.stdout.readline())
+            try:
+                payload = json.dumps({"cmd": cmd, "args": args})
+                self.proc.stdin.write(payload + "\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline()
+                if not line:
+                    return {"status": "error", "message": "Backend closed pipe"}
+                return json.loads(line)
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
         else:
-            # 従来のHTTP通信
             try:
                 if cmd == "write":
                     res = httpx.post(f"{self.url}/write", json={"content": args[0]})
@@ -65,6 +77,8 @@ def main():
             console.print(result)
             
         except KeyboardInterrupt:
+            break
+        except (EOFError, BrokenPipeError):
             break
         except Exception as e:
             console.print(f"[red]Error: {e}[/red]")
