@@ -1,6 +1,11 @@
+import os
 import sys
 import json
 import argparse
+
+# 実行ディレクトリをパスの先頭に追加して lib を確実に見つける
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/.."))
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
@@ -16,7 +21,7 @@ class CommitRequest(BaseModel):
 class AffixRequest(BaseModel):
     trait: str
 
-# --- FastAPI Routes (Existing Logic) ---
+# --- FastAPI Routes ---
 @app.post("/write")
 async def write_atom(req: CommitRequest):
     return engine.commit(req.content)
@@ -25,9 +30,10 @@ async def write_atom(req: CommitRequest):
 async def affix_trait(key: str, req: AffixRequest):
     return engine.affix(key, req.trait)
 
-# --- stdio Handler (New Logic for Dependency Inversion) ---
+# --- stdio Handler ---
 def handle_stdio():
     """標準入出力経由でリクエストを処理するループ"""
+    # stderrに出力することでstdout(JSON通信用)を汚さない
     print("[Internal] Akasha Engine: stdio mode activated.", file=sys.stderr)
     
     for line in sys.stdin:
@@ -36,7 +42,6 @@ def handle_stdio():
             cmd = req.get("cmd")
             args = req.get("args", [])
             
-            # CLIからのコマンドを内部エンジンへルーティング
             if cmd == "write":
                 res = engine.commit(args[0])
             elif cmd == "affix":
@@ -61,5 +66,4 @@ if __name__ == "__main__":
         handle_stdio()
     else:
         import uvicorn
-        # ポート8000で通常起動
         uvicorn.run(app, host="0.0.0.0", port=8000)
