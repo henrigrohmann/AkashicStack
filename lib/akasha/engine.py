@@ -1,127 +1,128 @@
-import os
 import sqlite3
-import hashlib
 import json
+import hashlib
 from datetime import datetime
-from typing import List, Dict, Optional
+import os
 
 class AkashaEngine:
-    def __init__(self, db_path: Optional[str] = None):
-        # ルートディレクトリからの相対パス、またはHarmoniaから注入されたパスを使用
-        if db_path is None:
-            self.db_path = os.path.join(os.getcwd(), "data", "akasha.db")
-        else:
-            self.db_path = db_path
-            
-        self._ensure_directory()
-        self._bootstrap()
+    def __init__(self, db_path="data/akasha.db"):
+        # ディレクトリの存在を保証
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._create_tables()
 
-    def _ensure_directory(self):
-        db_dir = os.path.dirname(self.db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
+    def _create_tables(self):
+        # Chunks: Atom本体の保存
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                key TEXT PRIMARY KEY,
+                content TEXT,
+                created_at TEXT
+            )
+        """)
+        # Traits: 属性・タグ・集合情報の保存
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS traits (
+                key TEXT,
+                trait TEXT,
+                FOREIGN KEY(key) REFERENCES chunks(key)
+            )
+        """)
+        self.conn.commit()
 
-    def _bootstrap(self):
-        """テーブル作成とジャーナル構造の初期化"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS chunks (
-                    key TEXT PRIMARY KEY, 
-                    content TEXT NOT NULL, 
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.execute("CREATE TABLE IF NOT EXISTS traits (key TEXT, trait TEXT, PRIMARY KEY (key, trait))")
-            conn.execute("CREATE TABLE IF NOT EXISTS sets (name TEXT PRIMARY KEY)")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS set_items (
-                    set_name TEXT, 
-                    key TEXT, 
-                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
-                    PRIMARY KEY (set_name, key)
-                )
-            """)
-            # ジャーナルをより「不沈」な構造へ強化
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS journals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                    action TEXT NOT NULL, 
-                    params TEXT, 
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.commit()
-
-    def _write_with_journal(self, action: str, params: Dict, sql_query: str, sql_params: tuple):
-        """操作とログを単一のトランザクションで実行（アトミック性確保）"""
+    # --- 基本操作: Write / Read / Stream ---
+    def commit(self, content: str):
+        """Atomを書き込み、SHA-256のKeyを返す"""
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        key = hashlib.sha256(content.encode()).hexdigest()
+        
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                # 1. 実際のデータ操作
-                conn.execute(sql_query, sql_params)
-                # 2. ジャーナルの記録
-                conn.execute("INSERT INTO journals (action, params) VALUES (?, ?)", (action, json.dumps(params)))
-                conn.commit()
-        except sqlite3.Error as e:
-            # ここで発生したエラーは上位（Harmonia等）に伝播させ、Master Logに記録させる
-            raise e
+            self.conn.execute(
+                "INSERT INTO chunks (key, content, created_at) VALUES (?, ?, ?)",
+                (key, content, created_at)
+            )
+            self.conn.commit()
+            return {"status": "committed", "key": key}
+        except sqlite3.IntegrityError:
+            return {"status": "exists", "key": key}
 
-    def commit(self, content: str) -> Dict:
-        normalized = content.strip()
-        key = hashlib.sha256(normalized.encode()).hexdigest()
-        
-        self._write_with_journal(
-            "COMMIT", {"key": key},
-            "INSERT OR IGNORE INTO chunks (key, content) VALUES (?, ?)", (key, normalized)
+    def stream(self, limit=10):
+        """最近のAtomを一覧表示（Trait情報も結合）"""
+        cursor = self.conn.execute(
+            "SELECT key, content, created_at FROM chunks ORDER BY created_at DESC LIMIT ?",
+            (limit,)
         )
-        return {"key": key, "status": "committed"}
-
-    def fetch(self, key: str) -> Dict:
-        if not key or key == "None": return {"error": "key_required"}
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT * FROM chunks WHERE key = ?", (key,)).fetchone()
-            if not row: return {"key": key, "error": "not_found"}
-            traits = [r[0] for r in conn.execute("SELECT trait FROM traits WHERE key = ?", (key,)).fetchall()]
-        return {"key": key, "content": row["content"], "created_at": row["created_at"], "traits": traits}
-
-    def affix(self, key: str, trait: str) -> Dict:
-        # 存在確認
-        target = self.fetch(key)
-        if "error" in target: return target
+        rows = cursor.fetchall()
         
-        self._write_with_journal(
-            "AFFIX", {"key": key, "trait": trait},
-            "INSERT OR IGNORE INTO traits (key, trait) VALUES (?, ?)", (key, trait)
+        results = []
+        for row in rows:
+            key = row[0]
+            # 各Atomに紐づくTraitを取得
+            t_cursor = self.conn.execute("SELECT trait FROM traits WHERE key = ?", (key,))
+            traits = [t[0] for t in t_cursor.fetchall()]
+            results.append({
+                "key": key,
+                "content": row[1],
+                "created_at": row[2],
+                "traits": traits
+            })
+        return results
+
+    # --- Trait (属性) 操作 ---
+    def affix(self, key: str, trait: str):
+        """Atomに属性(Trait)を付与する"""
+        # 重複登録を防ぐ
+        cursor = self.conn.execute(
+            "SELECT 1 FROM traits WHERE key = ? AND trait = ?", (key, trait)
         )
-        return self.fetch(key)
+        if not cursor.fetchone():
+            self.conn.execute(
+                "INSERT INTO traits (key, trait) VALUES (?, ?)", (key, trait)
+            )
+            self.conn.commit()
+        return {"status": "affixed", "key": key, "trait": trait}
 
-    def create_set(self, name: str) -> Dict:
-        self._write_with_journal(
-            "SET_CREATE", {"name": name},
-            "INSERT OR IGNORE INTO sets (name) VALUES (?)", (name,)
+    def remove_trait(self, key: str, trait: str):
+        """特定のAtomから指定した属性を削除する"""
+        self.conn.execute(
+            "DELETE FROM traits WHERE key = ? AND trait = ?",
+            (key, trait)
         )
-        return {"status": "created", "name": name}
+        self.conn.commit()
+        return {"status": "success", "key": key, "removed_trait": trait}
 
-    def add_to_set(self, name: str, key: str) -> Dict:
-        if not key or key == "None": return {"key": key, "error": "key_invalid"}
-        
-        # 集合の存在保証とアイテム追加をアトミックに行うために分離
-        self.create_set(name)
-        target = self.fetch(key)
-        if "error" in target: return target
-        
-        self._write_with_journal(
-            "SET_ADD", {"name": name, "key": key},
-            "INSERT OR IGNORE INTO set_items (set_name, key) VALUES (?, ?)", (name, key)
+    def find_by_trait(self, trait: str):
+        """属性を指定してAtomを検索する"""
+        cursor = self.conn.execute(
+            """
+            SELECT c.key, c.content, c.created_at 
+            FROM chunks c 
+            JOIN traits t ON c.key = t.key 
+            WHERE t.trait = ?
+            """, (trait,)
         )
-        return {"status": "added", "name": name, "key": key}
+        return [{"key": r[0], "content": r[1], "created_at": r[2]} for r in cursor.fetchall()]
 
-    def fetch_set(self, name: str, limit: int = 20) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
-            keys = [r[0] for r in conn.execute("SELECT key FROM set_items WHERE set_name = ? ORDER BY added_at DESC LIMIT ?", (name, limit)).fetchall()]
-        return [self.fetch(k) for k in keys]
+    # --- Set (集合) 操作 ---
+    def add_to_set(self, set_name: str, key: str):
+        """Atomを集合(Set)に登録する。内部的には 'set:{name}' というTraitとして扱う"""
+        return self.affix(key, f"set:{set_name}")
 
-    def stream(self, limit: int = 20) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
-            keys = [r[0] for r in conn.execute("SELECT key FROM chunks ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()]
-        return [self.fetch(k) for k in keys]
+    def list_sets(self):
+        """存在する集合(Set)の一覧をプレフィックスなしで取得する"""
+        cursor = self.conn.execute(
+            "SELECT DISTINCT trait FROM traits WHERE trait LIKE 'set:%'"
+        )
+        return [{"set_name": row[0].replace("set:", "")} for row in cursor.fetchall()]
+
+    def get_set_members(self, set_name: str):
+        """特定の集合に属するAtom一覧を返す"""
+        return self.find_by_trait(f"set:{set_name}")
+
+    # --- 削除操作 ---
+    def delete_atom(self, key: str):
+        """Atom本体とその属性情報を完全に削除する"""
+        self.conn.execute("DELETE FROM chunks WHERE key = ?", (key,))
+        self.conn.execute("DELETE FROM traits WHERE key = ?", (key,))
+        self.conn.commit()
+        return {"status": "deleted", "key": key}
