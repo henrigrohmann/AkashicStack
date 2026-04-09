@@ -12,14 +12,13 @@ console = Console()
 class AkashaAdapter:
     def __init__(self, mode="stdio"):
         self.mode = mode
-        if mode == "stdio":
-            env = os.environ.copy()
-            env["PYTHONPATH"] = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            self.proc = subprocess.Popen(
-                [sys.executable, "api/main.py", "--stdio"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
-                text=True, bufsize=1, env=env
-            )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.proc = subprocess.Popen(
+            [sys.executable, "api/main.py", "--stdio"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
+            text=True, bufsize=1, env=env
+        )
 
     def call(self, cmd, args=[]):
         try:
@@ -31,13 +30,20 @@ class AkashaAdapter:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-def display_help(commands):
-    table = Table(title="Akashic Commands", show_header=True, header_style="bold magenta")
-    table.add_column("Command", style="cyan")
-    table.add_column("Description", style="white")
-    for cmd, desc in commands.items():
-        table.add_row(cmd, desc)
-    console.print(table)
+def display_result(result):
+    if isinstance(result, list):
+        if not result:
+            console.print("[yellow]Empty result.[/yellow]")
+            return
+        table = Table(show_header=True, header_style="bold blue")
+        # カラム名の動的取得
+        for key in result[0].keys():
+            table.add_column(key)
+        for item in result:
+            table.add_row(*[str(v) for v in item.values()])
+        console.print(table)
+    else:
+        console.print(result)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -45,7 +51,7 @@ def main():
     cli_args = parser.parse_args()
 
     adapter = AkashaAdapter(mode="stdio")
-    console.print(Panel("[bold cyan]Akashic Stack CLI v0.2.1[/bold cyan]\n[dim]Ready for deployment test.[/dim]", expand=False))
+    console.print(Panel("[bold cyan]Akashic Stack CLI v0.2.1[/bold cyan]\n[dim]Dynamic Identity & Environment Verified.[/dim]", expand=False))
 
     while True:
         try:
@@ -59,17 +65,14 @@ def main():
             result = adapter.call(cmd, args)
             
             if cmd == "help" and "commands" in result:
-                display_help(result["commands"])
-            elif isinstance(result, list): # 一覧表示系
-                table = Table(show_header=True, header_style="bold blue")
-                if len(result) > 0:
-                    for key in result[0].keys(): table.add_column(key)
-                    for item in result: table.add_row(*[str(v) for v in item.values()])
-                    console.print(table)
-                else:
-                    console.print("[yellow]Empty result.[/yellow]")
+                # ヘルプ表示用
+                table = Table(title="Akashic Commands", header_style="bold magenta")
+                table.add_column("Command")
+                table.add_column("Description")
+                for c, d in result["commands"].items(): table.add_row(c, d)
+                console.print(table)
             else:
-                console.print(result)
+                display_result(result)
             
         except (KeyboardInterrupt, EOFError): break
         except Exception as e: console.print(f"[red]Error: {e}[/red]")
