@@ -1,59 +1,65 @@
+import sys
+import json
+import argparse
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from lib.akasha.engine import AkashaEngine
 
-app = FastAPI(title="Akashic Stack API")
-
-# エンジンの初期化（環境変数などでDBパスを切り替え可能にする準備）
-# 明示的にインスタンス化することで、起動時の_bootstrapを確実に行う
+app = FastAPI()
 engine = AkashaEngine()
 
-class ChunkInput(BaseModel): content: str
-class TraitInput(BaseModel): trait: str
-class SetInput(BaseModel): name: str
+# --- API Data Models ---
+class CommitRequest(BaseModel):
+    content: str
 
-@app.post("/chunks", operation_id="write")
-async def create_chunk(input: ChunkInput): 
-    # engine.commit 内で _write_with_journal が呼ばれ、アトミックに保存されます
-    return engine.commit(input.content)
+class AffixRequest(BaseModel):
+    trait: str
 
-@app.get("/chunks/{key}", operation_id="read")
-async def read_chunk(key: str):
-    res = engine.fetch(key)
-    if "error" in res: 
-        raise HTTPException(status_code=404, detail="Not Found")
-    return res
+# --- FastAPI Routes (Existing Logic) ---
+@app.post("/write")
+async def write_atom(req: CommitRequest):
+    return engine.commit(req.content)
 
-@app.put("/chunks/{key}/traits", operation_id="tag")
-async def add_trait(key: str, input: TraitInput): 
-    res = engine.affix(key, input.trait)
-    if "error" in res:
-        raise HTTPException(status_code=404, detail="Key Not Found")
-    return res
+@app.post("/affix/{key}")
+async def affix_trait(key: str, req: AffixRequest):
+    return engine.affix(key, req.trait)
 
-@app.get("/chunks", operation_id="list")
-async def list_chunks(limit: int = 20): 
-    return engine.stream(limit=limit)
+# --- stdio Handler (New Logic for Dependency Inversion) ---
+def handle_stdio():
+    """標準入出力経由でリクエストを処理するループ"""
+    print("[Internal] Akasha Engine: stdio mode activated.", file=sys.stderr)
+    
+    for line in sys.stdin:
+        try:
+            req = json.loads(line)
+            cmd = req.get("cmd")
+            args = req.get("args", [])
+            
+            # CLIからのコマンドを内部エンジンへルーティング
+            if cmd == "write":
+                res = engine.commit(args[0])
+            elif cmd == "affix":
+                res = engine.affix(args[0], args[1])
+            elif cmd == "query":
+                res = engine.find_by_trait(args[0])
+            elif cmd == "list":
+                res = engine.stream(limit=int(args[0]) if args else 10)
+            else:
+                res = {"status": "error", "message": f"Unknown command: {cmd}"}
+            
+            print(json.dumps(res, ensure_ascii=False), flush=True)
+        except Exception as e:
+            print(json.dumps({"status": "error", "message": str(e)}), flush=True)
 
-# --- Set Operations: CLIとの互換性を最大化 ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stdio", action="store_true")
+    args, unknown = parser.parse_known_args()
 
-@app.post("/sets", operation_id="set_create")
-async def create_set(input: SetInput): 
-    return engine.create_set(input.name)
-
-@app.post("/sets/{name}/items", operation_id="set_add")
-async def add_to_set(name: str, key: Optional[str] = None): 
-    # CLI ($it) からの入力が空の場合のガード
-    if not key or key == "None":
-        # 422を避けてカスタムエラーを返すことで、CLI側のデバッグを容易にする
-        return {"key": key, "error": "key_invalid_or_empty_from_cli"}
-        
-    res = engine.add_to_set(name, key)
-    if "error" in res:
-        raise HTTPException(status_code=404, detail=f"Key {key} not found for set {name}")
-    return res
-
-@app.get("/sets/{name}", operation_id="set_list")
-async def list_set_items(name: str): 
-    return engine.fetch_set(name)
+    if args.stdio:
+        handle_stdio()
+    else:
+        import uvicorn
+        # ポート8000で通常起動
+        uvicorn.run(app, host="0.0.0.0", port=8000)
