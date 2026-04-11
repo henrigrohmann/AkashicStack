@@ -1,9 +1,12 @@
 import sys
+import os
 import json
 import argparse
 import threading
 from lib.akasha.manager import AkashaManager
 from lib.akasha.resolver import ContextResolver
+
+sys.path.append(os.getcwd()) # 実行時のカレントディレクトリを検索パスに追加
 
 class AkashaCore:
     """
