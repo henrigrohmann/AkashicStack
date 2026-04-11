@@ -1,124 +1,92 @@
-import os
 import sys
 import json
 import argparse
+import threading
+from lib.akasha.manager import AkashaManager
+from lib.akasha.resolver import ContextResolver
 
-# パス解決: 親ディレクトリの lib をインポート可能にする
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+class AkashaCore:
+    """
+    Akashaの全インターフェース（CLI, Flet, MCP）の背後で動く統合司令塔。
+    """
+    def __init__(self, mode="seeds"):
+        # seedsかenterpriseかで挙動を切り替えるマネージャー
+        self.manager = AkashaManager(is_enterprise=(mode == "enterprise"))
+        # セッションごとの直近キー履歴（$0, $1...用）
+        self.history_cache = {} # {client_id: [key_history]}
 
-try:
-    from fastapi import FastAPI
-    from lib.akasha.engine import AkashaEngine
-except ImportError as e:
-    print(f"[Error] Dependency missing: {e}", file=sys.stderr)
-    sys.exit(1)
-
-app = FastAPI()
-engine = AkashaEngine()
-
-def handle_stdio():
-    # CLI側の Adapter が読み取るまで、このメッセージがプロンプトのトリガーになる
-    print("[Internal] Akasha Engine: stdio mode activated.", file=sys.stderr)
-    
-    last_keys = []  # シリアル番号(0, 1, 2...)用キャッシュ
-    it_key = None   # $it 用キャッシュ
-
-    for line in sys.stdin:
+    def dispatch(self, json_rpc_req):
+        """
+        JSON-RPC 2.0形式の入力を受け取り、処理結果を返す。
+        """
         try:
-            line = line.strip()
-            if not line:
-                continue
+            req = json.loads(json_rpc_req) if isinstance(json_rpc_req, str) else json_rpc_req
+            method = req.get("method")
+            params = req.get("params", {})
+            client_id = params.get("client_id", "me")
+            req_id = req.get("id")
+
+            session = self.manager.get_session(client_id)
+            
+            # --- メソッド・ルーティング ---
+            if method == "write":
+                res = session.engine.commit(params.get("text", ""))
+                session.it_key = res.get("key")
+                # 履歴キャッシュを更新
+                self._update_history(client_id, res.get("key"))
                 
-            req = json.loads(line)
-            cmd = req.get("cmd")
-            args = req.get("args", [])
-            
-            # --- Key解決ロジック ---
-            def resolve_key(target):
-                nonlocal it_key
-                if not target or target == "$it":
-                    return it_key
-                if str(target).isdigit():
-                    idx = int(target)
-                    if 0 <= idx < len(last_keys):
-                        return last_keys[idx]
-                return target
+                # Enterpriseモードなら共有BBSへミラーリング
+                if self.manager.is_enterprise:
+                    self.manager.shared_queue.put({"content": f"[{client_id}] {params.get('text')}"})
+                
+                return self._format_response(res, req_id)
 
-            res = None
-            
-            # --- コマンド分岐 ---
-            if cmd == "write" and args:
-                # スペースで区切られた引数をすべて結合して一つの content にする
-                content = " ".join(args)
-                res = engine.commit(content)
-                if isinstance(res, dict) and res.get("key"):
-                    it_key = res["key"]
+            elif method == "read":
+                # 指示詞解決レイヤー（$it, $0 等）
+                resolved_id = ContextResolver.resolve(session, params, self.history_cache.get(client_id, []))
+                # 全アトムから該当を検索（将来的にengine側で最適化）
+                atoms = session.engine.stream(limit=1000)
+                result = next((a for a in atoms if a['key'] == resolved_id), {"error": "not_found"})
+                return self._format_response(result, req_id)
 
-            elif cmd == "list":
-                limit = int(args[0]) if (args and args[0].isdigit()) else 10
-                res = engine.stream(limit=limit)
-                # シリアル番号用にキャッシュを更新
-                last_keys = [item['key'] for item in res]
-                if last_keys:
-                    it_key = last_keys[0]
+            elif method == "list":
+                limit = params.get("limit", 10)
+                res = session.engine.stream(limit=limit)
+                return self._format_response(res, req_id)
 
-            elif cmd == "read":
-                k = resolve_key(args[0] if args else None)
-                atoms = engine.stream(limit=1000)
-                res = next((a for a in atoms if a['key'] == k), {"status": "error", "message": "Not found"})
-                if isinstance(res, dict) and "key" in res:
-                    it_key = res["key"]
+            else:
+                return self._format_error(-32601, f"Method '{method}' not found", req_id)
 
-            elif cmd == "affix" and len(args) >= 2:
-                target_key = resolve_key(args[0])
-                trait = args[1]
-                res = engine.affix(target_key, trait)
-
-            elif cmd == "set_add" and len(args) >= 1:
-                set_name = args[0]
-                target_key = resolve_key(args[1] if len(args) > 1 else None)
-                res = engine.add_to_set(set_name, target_key)
-
-            elif cmd == "set_list":
-                res = engine.list_sets()
-
-            elif cmd == "set_members" and args:
-                res = engine.get_set_members(args[0])
-
-            elif cmd == "remove_trait" and len(args) >= 2:
-                res = engine.remove_trait(resolve_key(args[0]), args[1])
-
-            elif cmd == "delete_atom" and args:
-                res = engine.delete_atom(resolve_key(args[0]))
-
-            elif cmd == "help":
-                res = {
-                    "status": "ok", 
-                    "commands": {
-                        "write": "<content>", 
-                        "list": "[limit]", 
-                        "read": "<ID|$it>", 
-                        "affix": "<ID|$it> <trait>", 
-                        "set_add": "<name> <ID|$it>", 
-                        "set_list": "-",
-                        "delete_atom": "<ID|$it>"
-                    }
-                }
-            
-            # 結果を JSON で一行出力 (flush必須)
-            print(json.dumps(res or {"status": "error", "message": "Unknown command"}, ensure_ascii=False), flush=True)
-            
         except Exception as e:
-            error_res = {"status": "error", "message": str(e)}
-            print(json.dumps(error_res, ensure_ascii=False), flush=True)
+            return self._format_error(-32603, str(e))
 
+    def _update_history(self, client_id, key):
+        if client_id not in self.history_cache:
+            self.history_cache[client_id] = []
+        self.history_cache[client_id].insert(0, key)
+        # 直近20件のみ保持
+        self.history_cache[client_id] = self.history_cache[client_id][:20]
+
+    def _format_response(self, result, req_id):
+        return {"jsonrpc": "2.0", "result": result, "id": req_id}
+
+    def _format_error(self, code, message, req_id=None):
+        return {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": req_id}
+
+# --- 実行エントリーポイント ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--stdio", action="store_true")
-    args, _ = parser.parse_known_args()
+    parser = argparse.ArgumentParser(description="Akasha Unified API Server")
+    parser.add_argument("--mode", default="seeds", choices=["seeds", "enterprise"])
+    parser.add_argument("--stdio", action="store_true", help="Enable MCP/CLI stdio mode")
+    args = parser.parse_args()
+
+    core = AkashaCore(mode=args.mode)
 
     if args.stdio:
-        handle_stdio()
-    else:
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+        # MCP / CLI エミュレーション用ループ
+        for line in sys.stdin:
+            if not line.strip(): continue
+            response = core.dispatch(line)
+            print(json.dumps(response, ensure_ascii=False), flush=True)
+            # バックグラウンドでセッションのクリーンアップ（GC）
+            core.manager.gc()
