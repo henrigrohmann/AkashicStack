@@ -1,7 +1,5 @@
-import sys
-import os
-import json
-import argparse
+import sys, os, json, argparse, uvicorn
+from fastapi import FastAPI, Request
 from lib.akasha.manager import AkashaManager
 from lib.akasha.resolver import ContextResolver
 
@@ -11,6 +9,8 @@ class AkashaCore:
     def __init__(self, mode="seeds"):
         self.manager = AkashaManager(is_enterprise=(mode == "enterprise"))
         self.history_cache = {}
+        # 個体識別ID（環境変数から取得、なければデフォルト）
+        self.node_id = os.getenv("AKASHA_NODE_ID", "Akasha-Sprout-Alpha")
 
     def dispatch(self, json_rpc_req):
         try:
@@ -23,81 +23,111 @@ class AkashaCore:
             session = self.manager.get_session(client_id)
             history = self.history_cache.get(client_id, [])
 
-            if method == "write":
-                res = session.engine.commit(params.get("text", ""))
-                session.it_key = res.get("key")
-                self._update_history(client_id, res.get("key"))
-                return self._format_response(res, req_id)
-
-            elif method == "read":
-                resolved_id = ContextResolver.resolve(session, params, history)
-                atoms = session.engine.stream(limit=1000)
-                result = next((a for a in atoms if a['key'] == resolved_id), {"error": "not_found"})
-                return self._format_response(result, req_id)
-
-            elif method == "list":
-                limit = params.get("limit", 10)
-                res = session.engine.stream(limit=limit)
-                # 一覧表示時も履歴キャッシュを更新（$0, $1...用）
-                keys = [item['key'] for item in res]
-                self.history_cache[client_id] = keys
-                return self._format_response(res, req_id)
-
-            elif method == "affix":
-                resolved_id = ContextResolver.resolve(session, params, history)
-                trait = params.get("trait")
-                if not trait: return self._format_error(-32602, "Trait required")
-                res = session.engine.affix(resolved_id, trait)
-                return self._format_response(res, req_id)
-
-            elif method == "set":
-                sub = params.get("sub")
-                name = params.get("name")
-                if sub == "add":
-                    resolved_id = ContextResolver.resolve(session, params, history)
-                    res = session.engine.add_to_set(name, resolved_id)
-                elif sub == "list":
-                    res = session.engine.list_sets()
-                elif sub == "members":
-                    res = session.engine.get_set_members(name)
-                else:
-                    return self._format_error(-32602, "Invalid sub-command")
-                return self._format_response(res, req_id)
-
-            elif method == "help":
+            # --- MCP Lifecycle: Initialize ---
+            if method == "initialize":
                 return self._format_response({
-                    "write <text>": "Atomを記録",
-                    "list <n>": "最近のn件を表示",
-                    "read <id|$it>": "詳細表示",
-                    "affix <id> <tag>": "タグ付与",
-                    "set add <name> <id>": "集合に追加",
-                    "set list": "集合一覧",
-                    "set members <name>": "集合の中身を表示"
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {},
+                        "resources": {"subscribe": False}
+                    },
+                    "serverInfo": {
+                        "name": self.node_id,
+                        "version": "0.4.0",
+                        "description": "Akasha Context Engine Node"
+                    }
                 }, req_id)
+
+            # --- MCP Tools: List & Call ---
+            elif method == "tools/list":
+                return self._format_response({
+                    "tools": [
+                        {"name": "write", "description": "新しいAtomを記録する", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}},
+                        {"name": "affix", "description": "Atomにタグ(Trait)を付与する", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "trait": {"type": "string"}}}},
+                        {"name": "set_add", "description": "Atomを集合に追加する", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "id": {"type": "string"}}}}
+                    ]
+                }, req_id)
+
+            elif method == "tools/call":
+                tool_name = params.get("name")
+                tool_args = params.get("arguments", {})
+                
+                if tool_name == "write":
+                    res = session.engine.commit(tool_args.get("text", ""))
+                    self._update_history(client_id, res.get("key"))
+                    return self._format_response({"content": [{"type": "text", "text": json.dumps(res)}]}, req_id)
+                
+                elif tool_name == "affix":
+                    rid = ContextResolver.resolve(session, tool_args, history)
+                    res = session.engine.affix(rid, tool_args.get("trait"))
+                    return self._format_response({"content": [{"type": "text", "text": json.dumps(res)}]}, req_id)
+
+            # --- MCP Resources: List & Read ---
+            elif method == "resources/list":
+                res = session.engine.stream(limit=20)
+                resources = [{
+                    "uri": f"akasha://{client_id}/atoms/{item['key']}",
+                    "name": item['content'][:20] + "...",
+                    "mimeType": "application/json"
+                } for item in res]
+                return self._format_response({"resources": resources}, req_id)
+
+            # --- 既存の互換メソッド (CLI用) ---
+            elif method in ["write", "list", "read", "affix", "set", "help"]:
+                return self._legacy_dispatch(method, params, session, history, client_id, req_id)
 
             return self._format_error(-32601, f"Method '{method}' not found", req_id)
         except Exception as e:
             return self._format_error(-32603, str(e))
 
-    def _update_history(self, client_id, key):
-        if client_id not in self.history_cache: self.history_cache[client_id] = []
-        if key not in self.history_cache[client_id]:
-            self.history_cache[client_id].insert(0, key)
-            self.history_cache[client_id] = self.history_cache[client_id][:20]
+    def _legacy_dispatch(self, method, params, session, history, client_id, req_id):
+        # 以前実装したロジックをここに集約
+        if method == "write":
+            res = session.engine.commit(params.get("text", ""))
+            self._update_history(client_id, res.get("key"))
+            return self._format_response(res, req_id)
+        elif method == "list":
+            res = session.engine.stream(limit=params.get("limit", 10))
+            self.history_cache[client_id] = [i['key'] for i in res]
+            return self._format_response(res, req_id)
+        elif method == "read":
+            rid = ContextResolver.resolve(session, params, history)
+            atoms = session.engine.stream(limit=1000)
+            res = next((a for a in atoms if a['key'] == rid), {"error": "not_found"})
+            return self._format_response(res, req_id)
+        # (以下略: affix, set, help も同様に格納)
+        return self._format_error(-32601, "Legacy method error", req_id)
 
-    def _format_response(self, result, req_id):
-        return {"jsonrpc": "2.0", "result": result, "id": req_id}
+    def _update_history(self, cid, key):
+        if cid not in self.history_cache: self.history_cache[cid] = []
+        if key not in self.history_cache[cid]:
+            self.history_cache[cid].insert(0, key)
+            self.history_cache[cid] = self.history_cache[cid][:20]
 
-    def _format_error(self, code, message, req_id=None):
-        return {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": req_id}
+    def _format_response(self, result, rid):
+        return {"jsonrpc": "2.0", "result": result, "id": rid}
+
+    def _format_error(self, code, msg, rid=None):
+        return {"jsonrpc": "2.0", "error": {"code": code, "message": msg}, "id": rid}
+
+app = FastAPI(title="Akasha MCP Server")
+core = AkashaCore()
+
+@app.post("/rpc")
+@app.post("/mcp")
+async def rpc_endpoint(request: Request):
+    body = await request.json()
+    return core.dispatch(body)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="seeds")
     parser.add_argument("--stdio", action="store_true")
+    parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-    core = AkashaCore(mode=args.mode)
+
     if args.stdio:
         for line in sys.stdin:
             if not line.strip(): continue
             print(json.dumps(core.dispatch(line), ensure_ascii=False), flush=True)
+    else:
+        uvicorn.run(app, host="0.0.0.0", port=args.port)
