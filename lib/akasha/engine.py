@@ -5,27 +5,24 @@ from datetime import datetime
 import os
 
 class AkashaEngine:
-    def __init__(self, db_path):
+    """大脳皮質(Cortex)・短期記憶(Hippocampus)用の汎用エンジン"""
+    def __init__(self, db_path, is_volatile=False):
+        self.is_volatile = is_volatile
+        if is_volatile and os.path.exists(db_path):
+            os.remove(db_path)  # 短期記憶は起動時にリセット
+        
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._create_tables()
 
     def _create_tables(self):
-        # Cortex/Hippocampus共通: Atom管理
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
                 key TEXT PRIMARY KEY, content TEXT, created_at TEXT
             )""")
         self.conn.execute("CREATE TABLE IF NOT EXISTS traits (key TEXT, trait TEXT)")
-        # Nucleus専用: システム設定・認証
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS nucleus (
-                category TEXT, identifier TEXT, data TEXT,
-                PRIMARY KEY(category, identifier)
-            )""")
         self.conn.commit()
 
-    # --- 大脳皮質(Cortex) / 短期記憶(Hippocampus) 共通操作 ---
     def commit(self, content: str):
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         key = hashlib.sha256(content.encode()).hexdigest()
@@ -47,13 +44,23 @@ class AkashaEngine:
         return results
 
     def affix(self, key: str, trait: str):
-        cursor = self.conn.execute("SELECT 1 FROM traits WHERE key = ? AND trait = ?", (key, trait))
-        if not cursor.fetchone():
-            self.conn.execute("INSERT INTO traits VALUES (?, ?)", (key, trait))
-            self.conn.commit()
+        self.conn.execute("INSERT OR IGNORE INTO traits VALUES (?, ?)", (key, trait))
+        self.conn.commit()
         return {"status": "affixed", "key": key, "trait": trait}
 
-    # --- Nucleus(中枢金庫) 専用操作 ---
+class NucleusEngine(AkashaEngine):
+    """中枢金庫(Nucleus)専用エンジン：汎用メソッドを制限し、金庫操作を追加"""
+    def _create_tables(self):
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS nucleus (
+                category TEXT, identifier TEXT, data TEXT,
+                PRIMARY KEY(category, identifier)
+            )""")
+        self.conn.commit()
+
+    def commit(self, content): raise PermissionError("Nucleus does not support generic commit.")
+    def stream(self, limit): raise PermissionError("Nucleus does not support generic stream.")
+
     def vault_store(self, category, identifier, data):
         self.conn.execute("INSERT OR REPLACE INTO nucleus VALUES (?, ?, ?)", (category, identifier, json.dumps(data)))
         self.conn.commit()
