@@ -1,4 +1,4 @@
-from .engine import AkashaEngine
+from .engine import AkashaEngine, NucleusEngine
 
 class AkashaSession:
     def __init__(self, client_id, role="cell"):
@@ -6,21 +6,19 @@ class AkashaSession:
         self.role = role
         self.it_key = None
         
-        # --- 垂直・水平マトリックス記憶のマウント ---
-        # 1. Nucleus (Globalのみ)
-        self.nucleus = AkashaEngine("data/central/nucleus.db")
-        # 2. Cortex
+        # 1. Nucleus (金庫)
+        self.nucleus = NucleusEngine("data/central/nucleus.db")
+        # 2. Cortex (皮質 - 永続)
         self.global_cortex = AkashaEngine("data/central/g_cortex.db")
         self.local_cortex  = AkashaEngine(f"data/cells/{client_id}/l_cortex.db")
-        # 3. Hippocampus
-        self.global_hippo  = AkashaEngine("data/temp/g_hippo.db")
-        self.local_hippo   = AkashaEngine(f"data/temp/{client_id}_hippo.db")
+        # 3. Hippocampus (短期記憶 - 揮発フラグ付与)
+        self.global_hippo  = AkashaEngine("data/temp/g_hippo.db", is_volatile=True)
+        self.local_hippo   = AkashaEngine(f"data/temp/{client_id}_hippo.db", is_volatile=True)
 
 class AkashaManager:
     def __init__(self):
         self.sessions = {}
-        # 管理DBを初期化
-        self.master_nucleus = AkashaEngine("data/central/nucleus.db")
+        self.master_nucleus = NucleusEngine("data/central/nucleus.db")
 
     def authenticate(self, client_id, secret):
         auth_data = self.master_nucleus.vault_retrieve("auth", client_id)
